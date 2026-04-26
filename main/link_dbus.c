@@ -12,6 +12,8 @@
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <stdint.h>
 
 static const char *TAG = "dbus";
@@ -118,6 +120,9 @@ static esp_err_t recv_bit(int *bit, uint32_t timeout_us) {
 
     // Wait until at least one line is low CONSISTENTLY (peer started a bit).
     // Debounce: require the same non-idle reading for ~10us to reject glitches.
+    // Yield to FreeRTOS every ~1ms so the idle task can run and pet the watchdog.
+    // Only this top-level wait yields — the post-edge handshake stays tight.
+    int64_t last_yield = now_us();
     while (1) {
         int t = read_pin(TIP);
         int r = read_pin(RING);
@@ -139,6 +144,14 @@ static esp_err_t recv_bit(int *bit, uint32_t timeout_us) {
             g_stats.timeout_waiting_start++;
             reset_lines();
             return ESP_ERR_TIMEOUT;
+        }
+        if (now_us() - last_yield > 1000) {
+            // vTaskDelay(1) — not taskYIELD(): IDLE is lower priority than main,
+            // so taskYIELD just resumes us. vTaskDelay actually unblocks IDLE so
+            // it can pet the watchdog. Only fires when we've already been idle
+            // 1ms with no edge — the calc takes ~1ms+ between bits anyway.
+            vTaskDelay(1);
+            last_yield = now_us();
         }
     }
 
