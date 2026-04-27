@@ -36,12 +36,27 @@ target_include_directories(mk_hello_8xp PRIVATE ${TILIBS_INCLUDE_DIRS})
 target_compile_options(mk_hello_8xp PRIVATE ${TILIBS_CFLAGS_OTHER})
 target_link_libraries(mk_hello_8xp PRIVATE ${TILIBS_LIBRARIES})
 
+add_executable(mk_link_loopback_8xp headless/mk_link_loopback_8xp.c)
+target_include_directories(mk_link_loopback_8xp PRIVATE ${TILIBS_INCLUDE_DIRS})
+target_compile_options(mk_link_loopback_8xp PRIVATE ${TILIBS_CFLAGS_OTHER})
+target_link_libraries(mk_link_loopback_8xp PRIVATE ${TILIBS_LIBRARIES})
+
 add_executable(tilem_headless headless/headless.c headless/tilem_embed.c)
 target_include_directories(tilem_headless PRIVATE
     ${TILIBS_INCLUDE_DIRS}
     "${TILEM_DIR}/emu")
 target_compile_options(tilem_headless PRIVATE ${TILIBS_CFLAGS_OTHER})
 target_link_libraries(tilem_headless PRIVATE
+    "${TILEM_LIB}"
+    ${TILIBS_LIBRARIES}
+    m)
+
+add_executable(link_loopback headless/link_loopback.c headless/tilem_embed.c)
+target_include_directories(link_loopback PRIVATE
+    ${TILIBS_INCLUDE_DIRS}
+    "${TILEM_DIR}/emu")
+target_compile_options(link_loopback PRIVATE ${TILIBS_CFLAGS_OTHER})
+target_link_libraries(link_loopback PRIVATE
     "${TILEM_LIB}"
     ${TILIBS_LIBRARIES}
     m)
