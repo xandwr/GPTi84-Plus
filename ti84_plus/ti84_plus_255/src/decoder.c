@@ -40,11 +40,34 @@
 #define PAGE_SIZE 0x4000  /* 16 KiB flash page */
 #define MAX_PAGES 0x80    /* 84+SE has 0x40, 84+CSE up to 0x80 */
 
+/* Sidecar (".meta") layout — fixed 217 bytes, all little-endian where applicable.
+ * The encoder needs more than the flash image to rebuild a byte-identical .8Xu:
+ * the TIFL header is mostly zeros but carries the live name/date/version fields,
+ * and TI's stream-0 / stream-2 each write to page 0 addrs 0x00..0x5F with bytes
+ * different from what stream 1 puts there. Last writer wins in flash, so the
+ * pre-overwrite versions are unrecoverable from os.bin alone.
+ *
+ *   0x00..0x4E (78 B)  TIFL header verbatim
+ *   0x4E..0x69 (27 B)  stream-0 boot signature (page 0 addr 0x0000)
+ *   0x69..0xC9 (96 B)  stream-1 page-0 prefix at the moment stream 1 ends
+ *                      (addrs 0x0000..0x005F, before stream 2 overwrites)
+ *   0xC9..0xD9 (16 B)  page-touched bitmap, LSB-first, bit n => page n touched
+ */
+#define META_LEN 0xD9
+#define META_OFF_HEADER 0x00
+#define META_OFF_S0 0x4E
+#define META_LEN_S0 27
+#define META_OFF_S1_PREFIX 0x69
+#define META_LEN_S1_PREFIX 96
+#define META_OFF_BITMAP 0xC9
+#define META_LEN_BITMAP 16
+
 struct tifl_header {
     unsigned major;
     unsigned minor;
     uint16_t type_magic;
     uint32_t data_len;
+    uint8_t  raw[HEADER_LEN];
 };
 
 enum tifl_err {
@@ -83,6 +106,7 @@ static int read_tifl_header(FILE *f, struct tifl_header *out) {
         return TIFL_ERR_BAD_MAGIC;
     }
 
+    memcpy(out->raw, buf, HEADER_LEN);
     out->major = bcd_to_uint(buf[OFF_VERSION]);
     out->minor = bcd_to_uint(buf[OFF_VERSION + 1]);
 
@@ -186,6 +210,13 @@ struct walk_stats {
     uint16_t page_min[MAX_PAGES];       /* lowest addr written, per page */
     uint16_t page_max_end[MAX_PAGES];   /* one past highest addr written */
     unsigned pages_touched;             /* count of distinct pages */
+
+    /* Round-trip metadata, only populated by walk_records. See META_* in the
+     * header section above for the on-disk layout. */
+    uint8_t  s0_signature[META_LEN_S0];          /* stream-0's only data record */
+    uint8_t  s1_p0_prefix[META_LEN_S1_PREFIX];   /* page 0 [0..96) at end of stream 1 */
+    int      have_s0;
+    int      have_s1_prefix;
 };
 
 /* TI's .8Xu departs from the Intel HEX spec for type-02 records. Standard HEX
@@ -218,6 +249,18 @@ static int walk_records(const uint8_t *payload, size_t len, struct walk_stats *s
     struct walker w = { .cur_page = 0, .have_page = 1 };
     size_t pos = 0;
     size_t lineno = 0;
+
+    /* Stream index tracks which type-01-delimited stream we're inside.
+     *   stream 0 = boot signature (1 data record at page 0 / 0x0000)
+     *   stream 1 = main OS payload (the bulk)
+     *   stream 2 = post-install trampoline that overwrites stream-1's first
+     *              96 bytes of page 0
+     * For round-trip we need the page-0 [0..96) bytes as written by stream 1
+     * before stream 2 stomps them. We mirror stream-1 writes locally; the
+     * caller's flash buffer (if any) sees every write, last-wins. */
+    unsigned stream_idx = 0;
+    uint8_t s1_p0_prefix[META_LEN_S1_PREFIX];
+    memset(s1_p0_prefix, 0xFF, sizeof(s1_p0_prefix));
 
     while (pos < len) {
         size_t next;
@@ -271,6 +314,23 @@ static int walk_records(const uint8_t *payload, size_t len, struct walk_stats *s
             st->data_records++;
             st->data_bytes += r.len;
 
+            /* Stream 0's single data record is the boot signature. */
+            if (stream_idx == 0 && !st->have_s0 && p == 0 && off == 0 &&
+                r.len == META_LEN_S0) {
+                memcpy(st->s0_signature, r.data, META_LEN_S0);
+                st->have_s0 = 1;
+            }
+
+            /* Mirror stream-1 writes that fall in page 0 [0..96) so we can
+             * snapshot the prefix at stream 1's EOF before stream 2 overwrites
+             * those bytes in the flash buffer. */
+            if (stream_idx == 1 && p == 0 && off < META_LEN_S1_PREFIX) {
+                size_t copy_off = off;
+                size_t copy_end = (size_t)off + r.len;
+                if (copy_end > META_LEN_S1_PREFIX) copy_end = META_LEN_S1_PREFIX;
+                memcpy(s1_p0_prefix + copy_off, r.data, copy_end - copy_off);
+            }
+
             if (cb) {
                 int crc = cb(p, off, r.data, r.len, user);
                 if (crc != 0) return crc;
@@ -281,6 +341,11 @@ static int walk_records(const uint8_t *payload, size_t len, struct walk_stats *s
             /* End of stream. TI concatenates multiple HEX streams; the next
              * stream re-starts at page 0 unless overridden by a type-02. */
             st->eof_records++;
+            if (stream_idx == 1 && !st->have_s1_prefix) {
+                memcpy(st->s1_p0_prefix, s1_p0_prefix, META_LEN_S1_PREFIX);
+                st->have_s1_prefix = 1;
+            }
+            stream_idx++;
             w.cur_page = 0;
             w.have_page = 1;
             break;
@@ -314,6 +379,45 @@ static int store_page_byte(uint16_t page, uint16_t off, const uint8_t *data, uin
     uint8_t *buf = user;
     /* walk_records already validated page < MAX_PAGES and off+len <= PAGE_SIZE. */
     memcpy(buf + (size_t)page * PAGE_SIZE + off, data, len);
+    return 0;
+}
+
+/* Builds the sidecar .meta blob. Returns 0 on success, -1 if any required
+ * snapshot was missing (the input was missing stream 0 or stream 1). */
+static int build_meta(const struct tifl_header *h, const struct walk_stats *st,
+                      uint8_t out[META_LEN]) {
+    if (!st->have_s0) {
+        fprintf(stderr, "meta: stream-0 boot signature not seen in input\n");
+        return -1;
+    }
+    if (!st->have_s1_prefix) {
+        fprintf(stderr, "meta: stream-1 page-0 prefix not seen in input\n");
+        return -1;
+    }
+    memset(out, 0, META_LEN);
+    memcpy(out + META_OFF_HEADER, h->raw, HEADER_LEN);
+    memcpy(out + META_OFF_S0, st->s0_signature, META_LEN_S0);
+    memcpy(out + META_OFF_S1_PREFIX, st->s1_p0_prefix, META_LEN_S1_PREFIX);
+    for (unsigned p = 0; p < MAX_PAGES; p++) {
+        if (st->page_touched[p]) {
+            out[META_OFF_BITMAP + (p >> 3)] |= (uint8_t)(1u << (p & 7));
+        }
+    }
+    return 0;
+}
+
+static int write_meta(const uint8_t meta[META_LEN], const char *path) {
+    FILE *out = fopen(path, "wb");
+    if (!out) {
+        perror(path);
+        return -1;
+    }
+    if (fwrite(meta, 1, META_LEN, out) != META_LEN) {
+        fprintf(stderr, "%s: short write\n", path);
+        fclose(out);
+        return -1;
+    }
+    fclose(out);
     return 0;
 }
 
@@ -475,6 +579,25 @@ int main(int argc, char **argv) {
         }
         printf("\nwrote %u pages (%u bytes) to %s\n",
                st.pages_touched, st.pages_touched * PAGE_SIZE, out_path);
+
+        /* Sidecar meta file: <out_path>.meta — required for round-trip encoding. */
+        size_t meta_path_len = strlen(out_path) + 6;
+        char *meta_path = malloc(meta_path_len);
+        if (!meta_path) {
+            fprintf(stderr, "out of memory\n");
+            free(flash);
+            return 1;
+        }
+        snprintf(meta_path, meta_path_len, "%s.meta", out_path);
+
+        uint8_t meta[META_LEN];
+        if (build_meta(&h, &st, meta) != 0 || write_meta(meta, meta_path) != 0) {
+            free(meta_path);
+            free(flash);
+            return 1;
+        }
+        printf("wrote %d bytes of round-trip metadata to %s\n", META_LEN, meta_path);
+        free(meta_path);
     }
     free(flash);
     return 0;

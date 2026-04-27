@@ -9,6 +9,7 @@ firmware_cmakelists := firmware_src / "CMakeLists.txt"
 decoder_src := repo_root / "ti84_plus"
 decoder_build := decoder_src / "build"
 decoder_binary := decoder_build / "decoder"
+encoder_binary := decoder_build / "encoder"
 decoder_default_input := decoder_src / "ti84_plus_255/TI84Plus_OS255.8Xu"
 
 # List available recipes.
@@ -65,6 +66,41 @@ decode *args:
 decode-clean:
     rm -rf "{{decoder_build}}"
     @echo "Removed {{decoder_build}}"
+
+# Encode os.bin + os.bin.meta back into a .8Xu.
+# Args: <os.bin> <out.8Xu>. The meta file is read from <os.bin>.meta.
+encode bin out:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -f "{{decoder_build}}/CMakeCache.txt" ]]; then
+        cmake -S "{{decoder_src}}" -B "{{decoder_build}}"
+    fi
+    cmake --build "{{decoder_build}}" --target encoder -j
+    exec "{{encoder_binary}}" "{{bin}}" "{{bin}}.meta" "{{out}}"
+
+# Decode then re-encode and verify byte-identical round-trip.
+# With 0 args, runs against the bundled OS 2.55. With 1 arg, against that file.
+roundtrip *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -f "{{decoder_build}}/CMakeCache.txt" ]]; then
+        cmake -S "{{decoder_src}}" -B "{{decoder_build}}"
+    fi
+    cmake --build "{{decoder_build}}" --target decoder encoder -j
+    args=({{args}})
+    input="${args[0]:-{{decoder_default_input}}}"
+    base="$(basename "$input" .8Xu)"
+    bin="{{decoder_build}}/${base}.bin"
+    out="{{decoder_build}}/${base}.roundtrip.8Xu"
+    "{{decoder_binary}}" "$input" "$bin" >/dev/null
+    "{{encoder_binary}}" "$bin" "$bin.meta" "$out" >/dev/null
+    if cmp -s "$input" "$out"; then
+        echo "OK: $out is byte-identical to $input"
+    else
+        echo "MISMATCH between $input and $out" >&2
+        cmp "$input" "$out" || true
+        exit 1
+    fi
 
 # Format all C/C++ sources outside vendor/ and build/.
 fmt:

@@ -13,3 +13,4 @@ endif()
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_executable(decoder ti84_plus_255/src/decoder.c)
+add_executable(encoder ti84_plus_255/src/encoder.c)
