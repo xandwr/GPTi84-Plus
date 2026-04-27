@@ -7,3 +7,6 @@
 [submodule "vendor/libnspire-rs"]
 	path = vendor/libnspire-rs
 	url = git@github.com:lights0123/libnspire-rs.git
+[submodule "vendor/micropython"]
+	path = vendor/micropython
+	url = git@github.com:micropython/micropython.git

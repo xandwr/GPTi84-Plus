@@ -1,0 +1,9 @@
+[project]
+name = "ti84-superdeluxe"
+version = "0.1.0"
+description = "A crazy version of the Ti84 (and potentially, later, the Nspire CX ii)"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "mpremote>=1.28.0",
+]
