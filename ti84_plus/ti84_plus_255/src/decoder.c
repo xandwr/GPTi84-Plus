@@ -10,32 +10,37 @@
  * Default file names follow: D8[34][PC][BS]E[12].8xv
  *
  * .8Xu (TIFL) header layout — first bytes of the file:
- *   0x00: "**TIFL**"       (8-byte magic)
- *   0x08: major version    (BCD-packed byte: 0x02 = "2")
- *   0x09: minor version    (BCD-packed byte: 0x55 = "55")
+ *   0x00: "**TIFL**"        (8-byte magic)
+ *   0x08: major version     (BCD-packed byte: 0x02 = "2")
+ *   0x09: minor version     (BCD-packed byte: 0x55 = "55")
  *   0x0A: flags / reserved
  *   0x0B: object type
- *   0x0C..0x11: date       (BCD: DD MM YYYY, year as two bytes)
- *   0x12: name length
- *   0x13..0x1A: name       (8 bytes, zero-padded)
- *   0x1B..0x2F: filler / padding
- *   0x30..0x33: HEX record count (little-endian uint32, informational)
- *   0x34..0x49: filler / padding
+ *   0x0C..0x10: date        (BCD: DD MM YYYY)
+ *   0x11: name length
+ *   0x12..0x19: name        (8 bytes, "basecode" for OS files)
+ *   0x1A..0x2F: filler
+ *   0x30..0x31: type magic  (0x73 0x23 = TI-83+ family OS file)
+ *   0x32..0x49: filler
  *   0x4A..0x4D: payload byte length (little-endian uint32)
  *   0x4E: start of payload (Intel HEX records)
+ *
+ * Inside the payload, the first record's 10th data byte's low nibble is a
+ * "cert ID" distinguishing 83+ (0x04) from 84+ (0x0A). Determined empirically
+ * and corroborated by tari/rom8x.
  */
 
 #define TIFL_MAGIC "**TIFL**"
 #define TIFL_MAGIC_LEN 8
 #define OFF_VERSION 0x08
-#define OFF_RECORD_COUNT 0x30
+#define OFF_TYPE_MAGIC 0x30
+#define TYPE_MAGIC_OS_83PLUS 0x2373 /* little-endian 0x73 0x23 */
 #define OFF_DATA_LEN 0x4A
 #define HEADER_LEN 0x4E
 
 struct tifl_header {
     unsigned major;
     unsigned minor;
-    uint32_t record_count;
+    uint16_t type_magic;
     uint32_t data_len;
 };
 
@@ -43,6 +48,7 @@ enum tifl_err {
     TIFL_OK = 0,
     TIFL_ERR_TRUNCATED = -1,
     TIFL_ERR_BAD_MAGIC = -2,
+    TIFL_ERR_UNSUPPORTED_TYPE = -3,
 };
 
 enum hex_err {
@@ -78,14 +84,14 @@ static int read_tifl_header(FILE *f, struct tifl_header *out) {
     out->minor = bcd_to_uint(buf[OFF_VERSION + 1]);
 
     /* Little-endian: low byte first. Casts force unsigned shifts. */
-    out->record_count = (uint32_t)buf[OFF_RECORD_COUNT] |
-                        (uint32_t)buf[OFF_RECORD_COUNT + 1] << 8 |
-                        (uint32_t)buf[OFF_RECORD_COUNT + 2] << 16 |
-                        (uint32_t)buf[OFF_RECORD_COUNT + 3] << 24;
+    out->type_magic = (uint16_t)buf[OFF_TYPE_MAGIC] | (uint16_t)buf[OFF_TYPE_MAGIC + 1] << 8;
     out->data_len = (uint32_t)buf[OFF_DATA_LEN] | (uint32_t)buf[OFF_DATA_LEN + 1] << 8 |
                     (uint32_t)buf[OFF_DATA_LEN + 2] << 16 |
                     (uint32_t)buf[OFF_DATA_LEN + 3] << 24;
 
+    if (out->type_magic != TYPE_MAGIC_OS_83PLUS) {
+        return TIFL_ERR_UNSUPPORTED_TYPE;
+    }
     return TIFL_OK;
 }
 
@@ -276,6 +282,9 @@ int main(int argc, char **argv) {
         case TIFL_ERR_BAD_MAGIC:
             fprintf(stderr, "%s: not a TIFL file (bad magic)\n", path);
             return 1;
+        case TIFL_ERR_UNSUPPORTED_TYPE:
+            fprintf(stderr, "%s: unsupported TIFL object type\n", path);
+            return 1;
         }
         return 1;
     }
@@ -322,7 +331,8 @@ int main(int argc, char **argv) {
 
     printf("file:    %s\n", path);
     printf("version: %u.%02u\n", h.major, h.minor);
-    printf("records: %u (declared)\n", h.record_count);
+    printf("type:    0x%04X (%s)\n", h.type_magic,
+           h.type_magic == TYPE_MAGIC_OS_83PLUS ? "TI-83+/84+ OS" : "unknown");
     printf("payload: %zu bytes (header says %u)\n", payload_len, h.data_len);
 
     struct walk_stats st;
