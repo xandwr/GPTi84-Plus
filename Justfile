@@ -27,7 +27,7 @@ build target="":
         exit 1
     fi
     if [[ ! -f "{{firmware_build}}/CMakeCache.txt" ]]; then
-        cmake -S "{{firmware_src}}" -B "{{firmware_build}}"
+        cmake -S "{{firmware_src}}" --preset pico-w
     fi
     if [[ -n "$target" ]]; then
         cmake --build "{{firmware_build}}" --target "$target" -j
