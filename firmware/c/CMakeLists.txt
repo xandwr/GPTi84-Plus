@@ -25,10 +25,12 @@ pico_sdk_init()
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/CPM.cmake)
 
 add_executable(bringup
-    bringup.c
+    src/bringup.c
 )
 
-pico_generate_pio_header(bringup ${CMAKE_CURRENT_LIST_DIR}/bringup_pio.pio)
+target_include_directories(bringup PRIVATE src)
+
+pico_generate_pio_header(bringup ${CMAKE_CURRENT_LIST_DIR}/src/bringup_pio.pio)
 
 target_link_libraries(bringup
     pico_stdlib

@@ -1,4 +1,4 @@
-// Pico W bring-up validation in C, mirroring src/test_pico_data_works.py.
+// Pico W bring-up validation.
 //
 // Wiring: jumper between GP2 (pin 4) and GP3 (pin 5). GP2 driven, GP3 read.
 //
