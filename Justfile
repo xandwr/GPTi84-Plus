@@ -127,9 +127,16 @@ emu-clean:
     rm -rf "{{tilem_build}}"
     @echo "Removed {{tilem_build}}"
 
-# Boot the TilEm emulator with the dumped ROM (cold start, skinless).
+# Boot the TilEm emulator from saved state (falls back to cold ROM boot if no state file).
 emu: emu-build
-    "{{tilem_binary}}" -r "{{emu_rom}}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -f "{{emu_state}}" ]]; then
+        exec "{{tilem_binary}}" -s "{{emu_state}}"
+    else
+        echo "no state file at {{emu_state}} — cold-booting; quit-and-save to create one" >&2
+        exec "{{tilem_binary}}" -r "{{emu_rom}}"
+    fi
 
 # Boot from a saved clean state, optionally sending a file (.8Xu/.8Xp) on entry.
 # Falls back to a cold ROM boot if the state file doesn't exist yet.
