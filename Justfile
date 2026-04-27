@@ -14,6 +14,9 @@ decoder_default_input := decoder_src / "ti84_plus_255/TI84Plus_OS255.8Xu"
 
 emu_rom := decoder_src / "ti84_plus_255/xander_ti84_romdump_2026-04-27.rom"
 emu_state := decoder_src / "ti84_plus_255/clean.sav"
+tilem_src := repo_root / "vendor/tilem"
+tilem_build := tilem_src / "build"
+tilem_binary := tilem_build / "gui/tilem2"
 
 # List available recipes.
 default:
@@ -105,20 +108,36 @@ roundtrip *args:
         exit 1
     fi
 
+# Build the patched local TilEm (autotools, out-of-tree).
+emu-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -f "{{tilem_build}}/Makefile" ]]; then
+        mkdir -p "{{tilem_build}}"
+        cd "{{tilem_build}}"
+        ../configure --prefix="{{tilem_build}}/install"
+    fi
+    make -C "{{tilem_build}}" -j
+
+# Wipe the local TilEm build directory.
+emu-clean:
+    rm -rf "{{tilem_build}}"
+    @echo "Removed {{tilem_build}}"
+
 # Boot the TilEm emulator with the dumped ROM (cold start, skinless).
-emu:
-    tilem2 -r "{{emu_rom}}"
+emu: emu-build
+    "{{tilem_binary}}" -r "{{emu_rom}}"
 
 # Boot from a saved clean state, optionally sending a file (.8Xu/.8Xp) on entry.
 # Falls back to a cold ROM boot if the state file doesn't exist yet.
-emu-send *args:
+emu-send *args: emu-build
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ -f "{{emu_state}}" ]]; then
-        exec tilem2 -l -s "{{emu_state}}" {{args}}
+        exec "{{tilem_binary}}" -l -s "{{emu_state}}" {{args}}
     else
         echo "no state file at {{emu_state}} — cold-booting; quit-and-save to create one" >&2
-        exec tilem2 -l -r "{{emu_rom}}" {{args}}
+        exec "{{tilem_binary}}" -l -r "{{emu_rom}}" {{args}}
     fi
 
 # Decode + re-encode the default OS, then send the round-tripped .8Xu to the emulator.
@@ -127,6 +146,37 @@ emu-roundtrip: roundtrip
     set -euo pipefail
     base="$(basename "{{decoder_default_input}}" .8Xu)"
     just emu-send "{{decoder_build}}/${base}.roundtrip.8Xu"
+
+# Boot from clean state with a file in flight, capturing tilem_warning/tilem_message
+# output (stderr) to a log file. Use this to diagnose flash/link-layer issues.
+emu-trace *args: emu-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    log="{{decoder_build}}/tilem-trace.log"
+    mkdir -p "$(dirname "$log")"
+    echo "trace → $log (tail -f to follow)" >&2
+    if [[ -f "{{emu_state}}" ]]; then
+        "{{tilem_binary}}" -l -s "{{emu_state}}" {{args}} 2>"$log"
+    else
+        echo "no state file at {{emu_state}} — cold-booting; quit-and-save to create one" >&2
+        "{{tilem_binary}}" -l -r "{{emu_rom}}" {{args}} 2>"$log"
+    fi
+    echo "trace saved ($(wc -l <"$log") lines): $log" >&2
+
+# Collapse the latest emu-trace log into a count-prefixed unique-line summary,
+# preserving order of first occurrence so the boot/install timeline is readable.
+emu-trace-summary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    log="{{decoder_build}}/tilem-trace.log"
+    if [[ ! -f "$log" ]]; then
+        echo "no trace log at $log — run \`just emu-trace ...\` first" >&2
+        exit 1
+    fi
+    awk '
+        { count[$0]++; if (!($0 in seen)) { order[++n] = $0; seen[$0] = 1 } }
+        END { for (i = 1; i <= n; i++) printf "%6d  %s\n", count[order[i]], order[i] }
+    ' "$log"
 
 # Format all C/C++ sources outside vendor/ and build/.
 fmt:
