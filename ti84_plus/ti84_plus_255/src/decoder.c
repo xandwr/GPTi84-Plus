@@ -19,6 +19,8 @@ Ti84 Plus needs two pages dumped:
 #define NUM_PAGES 0x40
 #define FILE_NAME_LENGTH 128 // 128 bytes max?
 
+FILE *file8xu = NULL;
+
 int v_major, v_minor;
 int GetOSVersion(FILE*, int*, int*); // OS file, v_major, v_minor
 
@@ -29,52 +31,49 @@ int GetOSVersion(FILE *file8xu, int *v_major, int *v_minor)
 
     // magic version number offset
     fseek(file8xu, 0x6D, SEEK_SET);
-    fscanf(file8xu, "%2x", v_major);
+    fscanf(file8xu, "%d", v_major);
 
     fseek(file8xu, 0x73, SEEK_SET);
-    fscanf(file8xu, "%2x", v_minor);
+    fscanf(file8xu, "%d", v_minor);
 
     return (!fseek(file8xu, 0, SEEK_SET)); // beginning
 }
 
 int main(int argc, char **argv) {
-    
-    
     const char *path = argc > 1 ? argv[1] : "ti84_plus/ti84_plus_255/TI84Plus_OS255.8Xu";
     
-    FILE *f = fopen(path, "rb");
+    FILE *file8xu = fopen(path, "rb");
     GetOSVersion(file8xu, &v_major, &v_minor);
 
-    if (!f) {
+    if (!file8xu) {
         perror(path);
         return 1;
     }
 
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    rewind(f);
+    fseek(file8xu, 0, SEEK_END);
+    long len = ftell(file8xu);
+    rewind(file8xu);
 
     unsigned char *buf = malloc(len);
     if (!buf) {
-        fclose(f);
+        fclose(file8xu);
         fputs("out of memory\n", stderr);
         return 1;
     }
 
-    if (fread(buf, 1, len, f) != (size_t)len) {
+    if (fread(buf, 1, len, file8xu) != (size_t)len) {
         perror("fread");
         free(buf);
-        fclose(f);
+        fclose(file8xu);
         return 1;
     }
-    fclose(f);
+    fclose(file8xu);
 
-
-    printf("version: %d:%d" ,v_major, v_minor);
+    printf("\nversion major: %d (minor: %d)\n\n" ,v_major, v_minor);
     printf("read %ld bytes from %s\n", len, path);
     printf("first 1024 bytes:");
     for (int i = 0; i < 1024 && i < len; i++) {
-        printf(" %02x", buf[i]);
+        printf(" %d", buf[i]);
     }
     putchar('\n');
 
