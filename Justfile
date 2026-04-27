@@ -17,6 +17,9 @@ emu_state := decoder_src / "ti84_plus_255/clean.sav"
 tilem_src := repo_root / "vendor/tilem"
 tilem_build := tilem_src / "build"
 tilem_binary := tilem_build / "gui/tilem2"
+headless_binary := decoder_build / "tilem_headless"
+mk_hello_binary := decoder_build / "mk_hello_8xp"
+hello_8xp := decoder_src / "programs/HELLO.8Xp"
 
 # List available recipes.
 default:
@@ -177,6 +180,27 @@ emu-trace-summary:
         { count[$0]++; if (!($0 in seen)) { order[++n] = $0; seen[$0] = 1 } }
         END { for (i = 1; i <= n; i++) printf "%6d  %s\n", count[order[i]], order[i] }
     ' "$log"
+
+# Build (if needed) and run the headless TilEm harness.
+# Cold-boots from <emu_rom>+<emu_state>, sends a .8Xp through the graylink,
+# runs prgmHELLO from the homescreen, dumps the LCD as ASCII to stdout.
+# With no args, regenerates HELLO.8Xp first and uses it.
+emu-headless *args: emu-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -f "{{decoder_build}}/CMakeCache.txt" ]]; then
+        cmake -S "{{decoder_src}}" -B "{{decoder_build}}"
+    fi
+    cmake --build "{{decoder_build}}" --target tilem_headless mk_hello_8xp -j
+    args=({{args}})
+    if [[ ${#args[@]} -eq 0 ]]; then
+        mkdir -p "$(dirname "{{hello_8xp}}")"
+        "{{mk_hello_binary}}" "{{hello_8xp}}"
+        prog="{{hello_8xp}}"
+    else
+        prog="${args[0]}"
+    fi
+    exec "{{headless_binary}}" "{{emu_rom}}" "$prog" "{{emu_state}}"
 
 # Format all C/C++ sources outside vendor/ and build/.
 fmt:
