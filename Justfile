@@ -107,7 +107,7 @@ roundtrip *args:
 
 # Boot the TilEm emulator with the dumped ROM (cold start, skinless).
 emu:
-    tilem2 -l -r "{{emu_rom}}"
+    tilem2 -r "{{emu_rom}}"
 
 # Boot from a saved clean state, optionally sending a file (.8Xu/.8Xp) on entry.
 # Falls back to a cold ROM boot if the state file doesn't exist yet.
