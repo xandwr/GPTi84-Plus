@@ -12,6 +12,9 @@ decoder_binary := decoder_build / "decoder"
 encoder_binary := decoder_build / "encoder"
 decoder_default_input := decoder_src / "ti84_plus_255/TI84Plus_OS255.8Xu"
 
+emu_rom := decoder_src / "ti84_plus_255/xander_ti84_romdump_2026-04-27.rom"
+emu_state := decoder_src / "ti84_plus_255/clean.sav"
+
 # List available recipes.
 default:
     @just --list
@@ -101,6 +104,29 @@ roundtrip *args:
         cmp "$input" "$out" || true
         exit 1
     fi
+
+# Boot the TilEm emulator with the dumped ROM (cold start, skinless).
+emu:
+    tilem2 -l -r "{{emu_rom}}"
+
+# Boot from a saved clean state, optionally sending a file (.8Xu/.8Xp) on entry.
+# Falls back to a cold ROM boot if the state file doesn't exist yet.
+emu-send *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -f "{{emu_state}}" ]]; then
+        exec tilem2 -l -s "{{emu_state}}" {{args}}
+    else
+        echo "no state file at {{emu_state}} — cold-booting; quit-and-save to create one" >&2
+        exec tilem2 -l -r "{{emu_rom}}" {{args}}
+    fi
+
+# Decode + re-encode the default OS, then send the round-tripped .8Xu to the emulator.
+emu-roundtrip: roundtrip
+    #!/usr/bin/env bash
+    set -euo pipefail
+    base="$(basename "{{decoder_default_input}}" .8Xu)"
+    just emu-send "{{decoder_build}}/${base}.roundtrip.8Xu"
 
 # Format all C/C++ sources outside vendor/ and build/.
 fmt:

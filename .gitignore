@@ -33,3 +33,8 @@ generated/
 /*.uf2
 /*.hex
 /*.dis
+
+# Emu
+CEmu
+*.rom
+*.sav
