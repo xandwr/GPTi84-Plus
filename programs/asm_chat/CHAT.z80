@@ -1,7 +1,16 @@
-; CHAT.z80: chat-UI stub. Reads keys via _GetKey (which on the 84+ returns
-; resolved kKey codes, including alpha-shifted letters), accumulates a
-; line on row 7, redraws on every keystroke. [DEL] backspaces, [ENTER]
-; clears the line (DBUS send goes here next), [CLEAR] exits.
+; CHAT.z80: chat UI. Uses _GetCSC (NOT _GetKey) so the OS doesn't kick
+; us out when a silent-link transfer arrives mid-program. We own alpha
+; state ourselves: tap [ALPHA] to toggle alpha lock; an "A" indicator
+; shows on row 0 col 14 when alpha is engaged.
+;
+; [DEL] backspaces. [ENTER] sends the buffer as AppVar CHATMSG via
+; _SendVarCmd. [CLEAR] exits.
+;
+; Receive: every loop iteration polls for an AppVar named CHATIN. If
+; found, renders the (truncated) text on row 2 and deletes the var.
+; This works because we never call _GetKey, so the OS's silent-link
+; takeover path (which fires from inside _GetKey on the 84+) is
+; bypassed entirely.
 ;
 ; Build:  just asm  programs/asm_chat/CHAT.z80
 ; Push:   just push-asm programs/asm_chat/CHAT.z80
@@ -14,6 +23,7 @@
 .db     t2ByteTok, tAsmCmp
 
 BUFMAX  .equ    64
+INMAX   .equ    16              ; chars of incoming we render on row 2
 
         bcall(_ClrLCDFull)
         ld      hl, 0
@@ -24,26 +34,58 @@ BUFMAX  .equ    64
 
         xor     a
         ld      (buflen), a
+        ld      (alpha), a
+        ld      (last_sk), a
         ld      hl, buf
         ld      (hl), 0
+        call    redraw_alpha
 
 input_loop:
-        bcall(_GetKey)
-        cp      kClear
-        jp      z, done
-        cp      kEnter
-        jr      z, on_enter
-        cp      kDel
-        jr      z, on_del
+        ; Poll for inbound CHATIN every iteration. Cheap; _ChkFindSym
+        ; on a missing var is fast.
+        call    poll_chatin
 
-        call    key_to_ascii
+        ; ei + halt: yield to interrupts so the silent-link RTS handler
+        ; gets a chance to ACK incoming AppVar pushes from the Pico. A
+        ; spin loop on _GetCSC alone starves the OS link service and
+        ; the Pico's send_packet stalls at byte 0.
+        ei
+        halt
+
+        bcall(_GetCSC)
         or      a
         jr      z, input_loop
+
+        ; Edge-detect: same scan code held across multiple polls
+        ; reports as that scan code repeatedly. Suppress repeats by
+        ; ignoring any code equal to last_sk; only act on transitions.
+        ld      b, a
+        ld      a, (last_sk)
+        cp      b
+        jr      z, input_loop
+        ld      a, b
+        ld      (last_sk), a
+
+        ; Dispatch. Order: control keys first, then alpha toggle,
+        ; then char-producing keys.
+        cp      skClear
+        jp      z, done
+        cp      skEnter
+        jp      z, on_enter
+        cp      skDel
+        jp      z, on_del
+        cp      skAlpha
+        jr      z, on_alpha
+
+        ; Character-producing keys: resolve to ASCII (alpha-aware).
+        call    sk_to_ascii
+        or      a
+        jr      z, _input_no_key_release
 
         ld      b, a
         ld      a, (buflen)
         cp      BUFMAX
-        jr      nc, input_loop
+        jr      nc, _input_no_key_release
         ld      hl, buf
         ld      e, a
         ld      d, 0
@@ -54,12 +96,35 @@ input_loop:
         inc     hl
         ld      (hl), 0
         call    redraw_line
-        jr      input_loop
+        jr      _input_wait_release
+
+_input_no_key_release:
+        ; Even unmapped keys need to debounce; fall through.
+_input_wait_release:
+        ; Wait until the key is released before accepting another, so
+        ; one physical press = one character regardless of how long
+        ; it's held. ei + halt yields to interrupts so the silent-link
+        ; service can run if a Pico push lands while a key is held.
+        ei
+        halt
+        bcall(_GetCSC)
+        or      a
+        jr      nz, _input_wait_release
+        xor     a
+        ld      (last_sk), a
+        jp      input_loop
+
+on_alpha:
+        ld      a, (alpha)
+        xor     1
+        ld      (alpha), a
+        call    redraw_alpha
+        jr      _input_wait_release
 
 on_del:
         ld      a, (buflen)
         or      a
-        jr      z, input_loop
+        jp      z, _input_wait_release
         dec     a
         ld      (buflen), a
         ld      hl, buf
@@ -68,7 +133,7 @@ on_del:
         add     hl, de
         ld      (hl), 0
         call    redraw_line
-        jr      input_loop
+        jp      _input_wait_release
 
 on_enter:
         ld      a, (buflen)
@@ -124,7 +189,7 @@ _enter_clear:
         ld      hl, buf
         ld      (hl), 0
         call    redraw_line
-        jp      input_loop
+        jp      _input_wait_release
 
 done:
         bcall(_ClrLCDFull)
@@ -139,65 +204,185 @@ redraw_line:
         bcall(_PutS)
         ret
 
-; key_to_ascii: A in = kKey* code (post-alpha resolution by _GetKey),
-; A out = ASCII char or 0 if unmapped.
-;
-; kCapA..kCapZ are contiguous (0x9A..0xB3), so we range-check and
-; subtract. Digits and punctuation come through a small lookup table.
-key_to_ascii:
-        ; Letters first: kCapA (0x9A) <= A <= kCapZ (0xB3) -> 'A'..'Z'.
-        cp      kCapA
-        jr      c, _ka_table
-        cp      kCapZ + 1
-        jr      nc, _ka_table
-        sub     kCapA
-        add     a, 'A'
+; Draw the alpha-mode indicator at row 0 col 14: 'A' when alpha is on,
+; space when off.
+redraw_alpha:
+        ld      hl, $0E00        ; curCol=14 (H), curRow=0 (L)
+        ld      (curRow), hl
+        ld      a, (alpha)
+        or      a
+        ld      a, ' '
+        jr      z, _ra_put
+        ld      a, 'A'
+_ra_put:
+        bcall(_PutC)
         ret
 
-_ka_table:
+; poll_chatin: look for an AppVar named CHATIN. If present, copy its
+; text into inbuf (capped to INMAX, NUL-terminated), delete the var,
+; and redraw row 2. Preserves A across the call so it works as a
+; transparent insert after _GetKey.
+poll_chatin:
+        push    af
+        push    bc
+        push    de
+        push    hl
+
+        ld      hl, op1_chatin_name
+        rst     rMOV9TOOP1
+        bcall(_ChkFindSym)      ; cf=0 if found, DE=data ptr, HL=size
+        jr      c, _pc_done
+
+        ; Data area is [size_le16][bytes]. Skip the size word.
+        inc     de
+        inc     de
+
+        ; HL holds the AppVar's logical size (== bytes after size word).
+        ; Cap copy length to INMAX.
+        ld      a, h
+        or      a
+        jr      nz, _pc_cap     ; >255 bytes, definitely cap
+        ld      a, l
+        cp      INMAX + 1
+        jr      c, _pc_len_ok
+_pc_cap:
+        ld      a, INMAX
+_pc_len_ok:
         ld      c, a
-        ld      hl, key_table
-_kt_next:
+        ld      b, 0
+        ld      hl, inbuf
+        ; ldir copies BC bytes from (DE) to (HL): we want src=DE -> dst=HL,
+        ; but ldir is HL->DE. Swap.
+        ex      de, hl
+        ldir
+        ; HL now points just past the last copied dst byte; NUL-terminate.
+        xor     a
+        ld      (hl), a
+
+        ; Delete the AppVar. _DelVarArc needs OP1; reload.
+        ld      hl, op1_chatin_name
+        rst     rMOV9TOOP1
+        bcall(_ChkFindSym)      ; reestablish DE/HL/B for _DelVarArc
+        jr      c, _pc_render   ; gone already? just render what we have
+        bcall(_DelVarArc)
+
+_pc_render:
+        ld      hl, $0002        ; row 2, col 0
+        ld      (curRow), hl
+        bcall(_EraseEOL)
+        ld      hl, inbuf
+        bcall(_PutS)
+
+_pc_done:
+        pop     hl
+        pop     de
+        pop     bc
+        pop     af
+        ret
+
+; sk_to_ascii: A in = scan code (sk*), A out = ASCII or 0 if unmapped.
+; If alpha is engaged, search the alpha table first (so e.g. skMath -> 'A'
+; instead of unmapped). If not in alpha or not in alpha table, fall
+; through to the always-on table (digits + arithmetic + punctuation).
+sk_to_ascii:
+        ld      c, a
+        ld      a, (alpha)
+        or      a
+        jr      z, _sk_normal
+        ld      hl, alpha_table
+        call    _sk_lookup
+        or      a
+        ret     nz                ; alpha hit
+_sk_normal:
+        ld      a, c
+        ld      hl, normal_table
+        call    _sk_lookup
+        ret
+
+; _sk_lookup: HL -> [sk, ascii] pairs terminated by a 0 sk byte.
+; C = scan code to find. Returns A = ASCII char or 0.
+_sk_lookup:
         ld      a, (hl)
         or      a
-        ret     z
+        ret     z                 ; end of table, A=0
         cp      c
-        jr      z, _kt_hit
+        jr      z, _skl_hit
         inc     hl
         inc     hl
-        jr      _kt_next
-_kt_hit:
+        jr      _sk_lookup
+_skl_hit:
         inc     hl
         ld      a, (hl)
         ret
 
-key_table:
-        .db     k0,       '0'
-        .db     k1,       '1'
-        .db     k2,       '2'
-        .db     k3,       '3'
-        .db     k4,       '4'
-        .db     k5,       '5'
-        .db     k6,       '6'
-        .db     k7,       '7'
-        .db     k8,       '8'
-        .db     k9,       '9'
-        .db     kDecPnt,  '.'
-        .db     kAdd,     '+'
-        .db     kSub,     '-'
-        .db     kMul,     '*'
-        .db     kDiv,     '/'
-        .db     kLParen,  '('
-        .db     kRParen,  ')'
-        .db     kComma,   ','
-        .db     kSpace,   ' '
+; Table: keys that produce a character regardless of alpha mode.
+normal_table:
+        .db     sk0,      '0'
+        .db     sk1,      '1'
+        .db     sk2,      '2'
+        .db     sk3,      '3'
+        .db     sk4,      '4'
+        .db     sk5,      '5'
+        .db     sk6,      '6'
+        .db     sk7,      '7'
+        .db     sk8,      '8'
+        .db     sk9,      '9'
+        .db     skDecPnt, '.'
+        .db     skAdd,    '+'
+        .db     skSub,    '-'
+        .db     skMul,    '*'
+        .db     skDiv,    '/'
+        .db     skLParen, '('
+        .db     skRParen, ')'
+        .db     skComma,  ','
+        .db     0
+
+; Table: alpha-shifted keys -> letters/space. Layout matches the
+; "green ALPHA" labels above each key on the 84+ keypad. skApps (B)
+; is omitted; the include vendored here doesn't define it. sk0 is
+; mapped to space, the standard convention.
+alpha_table:
+        .db     skMath,   'A'
+        .db     skPrgm,   'C'
+        .db     skRecip,  'D'
+        .db     skSin,    'E'
+        .db     skCos,    'F'
+        .db     skTan,    'G'
+        .db     skPower,  'H'
+        .db     skSquare, 'I'
+        .db     skComma,  'J'
+        .db     skLParen, 'K'
+        .db     skRParen, 'L'
+        .db     skDiv,    'M'
+        .db     skLog,    'N'
+        .db     sk7,      'O'
+        .db     sk8,      'P'
+        .db     sk9,      'Q'
+        .db     skMul,    'R'
+        .db     sk4,      'S'
+        .db     sk5,      'T'
+        .db     sk6,      'U'
+        .db     skSub,    'V'
+        .db     sk1,      'W'
+        .db     sk2,      'X'
+        .db     sk3,      'Y'
+        .db     skAdd,    'Z'
+        .db     sk0,      ' '
+        .db     skDecPnt, ':'
+        .db     skChs,    '?'
         .db     0
 
 banner: .db     "asm_chat", 0
 op1_appvar_name:
         .db     AppVarObj, "CHATMSG", 0
+op1_chatin_name:
+        .db     AppVarObj, "CHATIN", 0, 0
 buf:    .db     0
         .fill   BUFMAX, 0
 buflen: .db     0
+inbuf:  .db     0
+        .fill   INMAX, 0
+alpha:  .db     0                 ; nonzero = alpha mode engaged
+last_sk: .db    0                 ; last scan code seen, for edge-detect
 
 .end

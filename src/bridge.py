@@ -88,6 +88,22 @@ def _wifi_with_retry():
             backoff = min(backoff * 2, 30)
 
 
+CHATIN_NAME = b"CHATIN\x00\x00"
+APPVAR = 0x15
+INMAX_BYTES = 16  # match CHAT.z80's INMAX so the calc can render it whole
+
+
+def _push_chatin(payload):
+    """Send `payload` to the calc as AppVar CHATIN. Truncates to INMAX_BYTES.
+    Returns True on success."""
+    body = payload[:INMAX_BYTES]
+    # Wire format for AppVar body: [size_le16][bytes].
+    framed = bytes([len(body) & 0xFF, (len(body) >> 8) & 0xFF]) + bytes(body)
+    print("bridge: -> calc CHATIN len=", len(body), "ascii=", repr(body))
+    return transfer.send_var(APPVAR, CHATIN_NAME, framed,
+                             calc_machine=0x73, quiet=True)
+
+
 def _make_on_var(sock_holder):
     """Closure capturing a 1-element list so we can null the socket out
     on send failure and have the supervisor reconnect."""
@@ -123,6 +139,7 @@ def run(name=None, expected_type=None):
     _wifi_with_retry()
 
     sock_holder = [None]
+    reader_holder = [None]
     on_var = _make_on_var(sock_holder)
 
     while True:
@@ -130,6 +147,7 @@ def run(name=None, expected_type=None):
             if sock_holder[0] is None:
                 _set_state(ST_SOCKET_DOWN)
                 sock_holder[0] = _connect_socket()
+                reader_holder[0] = net.FrameReader(sock_holder[0])
                 _set_state(ST_SOCKET_UP)
                 print("bridge: listen_loop running")
             # listen_loop blocks until traffic or timeout; on send failure
@@ -137,9 +155,17 @@ def run(name=None, expected_type=None):
             # socket, reconnect.
             transfer.listen_loop(name=name, expected_type=expected_type,
                                  on_var=on_var, timeout_ms=1000)
-            # Idle return: tick LED and re-enter listen_loop with the same
-            # socket. Do NOT reconnect on every idle return.
+            # Idle return: tick LED, drain inbound frames (each becomes a
+            # CHATIN AppVar push to the calc), then re-enter listen_loop
+            # with the same socket.
             _tick_led()
+            while True:
+                inbound = reader_holder[0].poll()
+                if inbound is None:
+                    break
+                _flash()
+                if not _push_chatin(inbound):
+                    print("bridge: CHATIN push failed (calc not idle?)")
         except KeyboardInterrupt:
             print("bridge: interrupted")
             try:
@@ -158,6 +184,7 @@ def run(name=None, expected_type=None):
             except Exception:
                 pass
             sock_holder[0] = None
+            reader_holder[0] = None
             # If wifi itself dropped, re-associate before retrying socket.
             import network
             if not network.WLAN(network.STA_IF).isconnected():
