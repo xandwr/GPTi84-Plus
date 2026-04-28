@@ -4,6 +4,8 @@ PY      := ".venv/bin/python"
 PYTEST  := ".venv/bin/pytest"
 MPR     := "mpremote"
 SRC     := "src"
+SPASM   := "spasm"
+SPASM_INC := "references/spasm"
 
 # default: list recipes
 default:
@@ -47,6 +49,18 @@ exec EXPR:
     {{MPR}} exec "{{EXPR}}"
 
 # --- e2e (calc must be plugged in and idle at the home screen) ---
+
+# Assemble a Z80 source with spasm-ng to a sibling .8xp.
+# Example: just asm programs/asm_hello/HELLO.z80
+asm FILE:
+    @echo "==> assembling {{FILE}}"
+    {{SPASM}} -I {{SPASM_INC}} {{FILE}} {{ without_extension(FILE) }}.8xp
+
+# Assemble a Z80 source then push the resulting .8Xp to the calc.
+# Example: just push-asm programs/asm_hello/HELLO.z80
+push-asm FILE:
+    just asm {{FILE}}
+    just push {{ without_extension(FILE) }}.8xp
 
 # Push a .8Xp program to the calc. Default is FLAPPY.
 push FILE="programs/flappy_bird/FLAPPY.8xp":
