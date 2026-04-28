@@ -1,0 +1,103 @@
+; HOOKINST.z80: install a homescreen hook that increments a counter
+; byte each time the OS calls into it during home screen rendering.
+; Proves the TIOS hook lifecycle end-to-end without touching the LCD.
+; Pair with HOOKSHOW.z80 to read the counter back.
+;
+; Earlier draft used getCSC: that hook gates key-scan results and the
+; passive-observer pattern caused the OS to spam the keybuffer (it
+; treated our return value as an injected keypress). The homescreen
+; hook is the correct fit anyway since the long-term goal is painting
+; a status indicator on the home screen.
+;
+; Layout in saveSScreen ($86EC, 768 bytes):
+;   $86EC: hook handler (must start with .db $83 OS marker)
+;   $870C: counter byte (1 byte, fixed addr so HOOKSHOW can find it)
+;
+; saveSScreen is the OS's graph-screen save buffer: touched only on
+; graph entry/exit, otherwise stable across home-screen and menu use.
+; appBackUpScreen was tried first and rejected: the OS reuses it for
+; graph/menu redraw and equation-editor scratch, so handler bytes get
+; clobbered mid-session and the next hook fire jumps into garbage.
+;
+; Build:  just asm  programs/asm_hookheart/HOOKINST.z80
+; Push:   just push-asm programs/asm_hookheart/HOOKINST.z80
+
+.nolist
+#include "ti83plus.inc"
+.list
+
+.org    $9D93
+.db     t2ByteTok, tAsmCmp
+
+HOOK_ADDR       .equ    saveSScreen             ; $86EC
+COUNTER_ADDR    .equ    saveSScreen + $20       ; $870C, well past handler
+
+        ; --- copy hook code into appBackUpScreen ---
+        ld      hl, hook_template
+        ld      de, HOOK_ADDR
+        ld      bc, hook_template_end - hook_template
+        ldir
+
+        ; --- zero the counter byte ---
+        xor     a
+        ld      (COUNTER_ADDR), a
+
+        ; --- install the homescreen hook ---
+        ; HL = hook address, A = page (1 = RAM)
+        ld      hl, HOOK_ADDR
+        ld      a, 1
+        bcall(_SetHomescreenHook)
+
+        ; --- print confirmation ---
+        bcall(_ClrLCDFull)
+        ld      hl, 0
+        ld      (curRow), hl
+        ld      hl, msg
+        bcall(_PutS)
+        ret
+
+msg:    .db     "hook installed", 0
+
+; --- hook handler template (copied to saveSScreen) ---
+; Homescreen hook ABI (WikiTI 83Plus:Hooks:9B8C):
+;   On entry: A = sub-event code
+;     0 = about to display a result (OP1 has value)
+;     1 = key pressed on homescreen (B = keycode)
+;     2 = expression entered to be evaluated
+;     3 = context changing TO homescreen
+;   On exit, OS dispatches on the **Z flag** (not carry):
+;     Z set  -> "OS continue normally" (passive observer wants this)
+;     Z clear -> "I handled it, OS skip default action"
+;
+; Active observer: count and write a heartbeat glyph into textShadow
+; at the top-right cell (row 0, col 15). textShadow is the OS's
+; source-of-truth for the home-screen text grid (16 cols x 8 rows,
+; row-major, 128 bytes), so writes here survive OS redraws : a direct
+; LCD paint via _PutMap gets wiped on the next CLEAR/ENTER because
+; the OS rebuilds the screen from textShadow.
+;
+; We alternate '*' / '.' on the counter's low bit so the user sees
+; a visible blink on each hook fire. No bcall: just a memory write,
+; safer than calling back into OS code from inside a hook.
+hook_template:
+        .db     $83                     ; OS marker, REQUIRED
+        push    af
+        push    hl
+
+        ld      hl, COUNTER_ADDR
+        inc     (hl)
+        ld      a, (hl)
+        and     1
+        ld      a, '*'
+        jr      nz, _hb_write
+        ld      a, '.'
+_hb_write:
+        ld      (textShadow + 15), a    ; row 0 col 15
+
+        pop     hl
+        pop     af
+        cp      a                       ; force Z, clear C, A intact
+        ret
+hook_template_end:
+
+.end

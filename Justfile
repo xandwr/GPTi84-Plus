@@ -86,6 +86,31 @@ roundtrip FILE="programs/flappy_bird/FLAPPY.8xp":
     @echo "==> running on Pico"
     {{MPR}} run /tmp/ti84_e2e_rt.py
 
+# Run the desktop-side TCP relay. Reads length-prefixed frames from
+# any connected client and prints them. Default port 9999.
+relay PORT="9999":
+    {{PY}} tools/relay_server.py --port {{PORT}}
+
+# Disable Pico autoboot of the bridge (renames main.py -> main.py.off).
+# Use during dev when autoboot fights mpremote run / repl.
+autoboot-off:
+    {{MPR}} exec 'import os; os.rename("main.py", "main.py.off")'
+
+# Re-enable Pico autoboot of the bridge.
+autoboot-on:
+    {{MPR}} exec 'import os; os.rename("main.py.off", "main.py")'
+
+# Bring up the calc<->desktop chat bridge on the Pico. Connects to
+# wifi (creds in src/secrets.py), opens a TCP socket to the desktop
+# (host/port in secrets.py), and forwards calc-initiated AppVar/Program
+# transfers as length-prefixed frames. Ctrl-C to stop.
+# Example: just chat-bridge CHATMSG 15
+chat-bridge NAME="" TYPE="":
+    @echo "==> generating bridge script (name={{NAME}} type={{TYPE}})"
+    {{PY}} tools/build_e2e.py bridge {{NAME}} {{TYPE}} > /tmp/ti84_e2e_bridge.py
+    @echo "==> running on Pico (Ctrl-C to stop)"
+    {{MPR}} run /tmp/ti84_e2e_bridge.py
+
 # Full e2e gate: host tests + push FLAPPY + roundtrip FLAPPY + roundtrip SEX.
 test-e2e: test
     just push  programs/flappy_bird/FLAPPY.8xp

@@ -1,0 +1,40 @@
+.nolist
+#include "ti83plus.inc"
+.list
+.org userMem-2
+        .db 0BBh,6Dh
+        ld ix,4024h
+        ld l,(ix+0)
+        ld h,(ix+1)
+        push hl
+        pop ix
+        ld hl,returnPoint1
+        push hl
+        ld a,7Eh
+        ld hl,4000h
+        jp (ix)
+returnPoint1:
+        ld ix,4024h
+        ld l,(ix+0)
+        ld h,(ix+1)
+        push hl
+        pop ix
+        ld hl,returnPoint2
+        push hl
+        ld a,7Eh
+        ld hl,6000h
+        jp (ix)
+returnPoint2:
+        ld ix,408Ah
+        ld l,(ix+0)
+        ld h,(ix+1)
+        push hl
+        pop ix
+        ld hl,returnPoint3
+        push hl
+        jp (ix)
+returnPoint3:
+        di
+        halt
+.end         
+end
