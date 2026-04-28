@@ -113,6 +113,14 @@ def _wifi_with_retry():
 
 STR2_NAME = str_name(2)
 
+# How long to wait after listen_loop returns before pushing Str2 back.
+# The calc OS needs wallclock time to unwind asm + redraw + rearm its
+# idle silent-link receive. Without this, the inbound RTS arrives before
+# the calc is listening and gets no ACK. Empirical floor (84+ at this
+# OS rev) lives between 375ms (fails) and 500ms (3/3 success); 600ms
+# gives a small safety margin without making the round-trip feel laggy.
+SETTLE_MS = 600
+
 # Calc Strings round-trip cleanly at small sizes; cap so a long LLM
 # reply doesn't blow past silent-link receive limits or wrap the home
 # screen into illegible scroll.
@@ -224,13 +232,7 @@ def run(name=None, expected_type=None):
                 if inbound is None:
                     break
                 _flash()
-                # Settle: the calc OS needs wallclock time to unwind the
-                # asm program (CHAT.z80's `ret`) back to the home screen
-                # and re-arm its idle silent-link receive. Without this,
-                # the inbound RTS hits the calc before it's listening
-                # and gets no ACK. 2s is comfortably above the floor we
-                # measured; reduce only with hardware retesting.
-                time.sleep_ms(2000)
+                time.sleep_ms(SETTLE_MS)
                 _push_str2(inbound)
         except KeyboardInterrupt:
             print("bridge: interrupted")
