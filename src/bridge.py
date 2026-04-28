@@ -108,6 +108,13 @@ INMAX_BYTES = 12   # _GetSmallPacket caps the calc-side recv at 14 bytes
                    # ASCII payload limit is 12. Truncate before stashing
                    # so we don't lie to the calc about size.
 
+ON_REQ_TIMEOUT_MS = 5000   # how long on_req blocks waiting for a frame
+                           # to land in the outbox before giving up and
+                           # SKIPping the calc's REQ. Sized for the
+                           # eventual LLM round-trip; relay-echo answers
+                           # in under a millisecond so this only kicks in
+                           # for slow upstreams or genuine no-reply.
+
 
 def _frame_to_appvar_payload(frame):
     """Convert a desktop-supplied frame into the wire-format AppVar body
@@ -118,18 +125,22 @@ def _frame_to_appvar_payload(frame):
     return bytes([len(body) & 0xFF, (len(body) >> 8) & 0xFF]) + body
 
 
-def _make_callbacks(sock_holder, outbox):
-    """Build (on_var, on_req) pair sharing closures over the sock holder
-    and the 1-slot outbox.
+def _make_callbacks(sock_holder, reader_holder, outbox):
+    """Build (on_var, on_req) pair sharing closures over the sock holder,
+    the FrameReader, and the 1-slot outbox.
 
     on_var (calc -> desktop): strip the AppVar size prefix from the
     inbound body and ship it as a TCP frame. If the socket is down we
     drop the frame (calc-side already got the silent-link confirmation
     so its UX won't hang).
 
-    on_req (calc -> Pico, Pico replies): if outbox has a frame, pop it
-    and return as wire-format AppVar payload. Else return None so the
-    Pico SKIPs the REQ (calc-side renders the no-reply state)."""
+    on_req (calc -> Pico, Pico replies): if the outbox already has a
+    frame, pop it and serve immediately. Otherwise pump the FrameReader
+    for up to ON_REQ_TIMEOUT_MS waiting for a frame to land. This turns
+    "outbox empty at REQ time" into "delayed reply" so the calc gets a
+    real response from a slow desktop instead of an unrecoverable
+    ERR:LINK from the Pico SKIPping. Returns None on genuine timeout
+    (Pico SKIPs)."""
 
     def on_var(type_id, name8, hdr, data):
         # AppVar (0x15) and Program (0x05/0x06) bodies are
@@ -164,9 +175,43 @@ def _make_callbacks(sock_holder, outbox):
         if type_id != APPVAR or bytes(name8) != CHATIN_NAME:
             print("  -> not CHATIN, returning None (Pico will SKIP)")
             return None
-        if outbox[0] is None:
-            print("  -> outbox empty, returning None (Pico will SKIP)")
-            return None
+
+        # Block up to ON_REQ_TIMEOUT_MS for a frame to be available.
+        # We're inside _respond_to_req, which has already received the
+        # calc's REQ but not yet sent ACK or SKIP. The calc's
+        # _SendRAMCmd is sitting waiting for the reply, so a few-second
+        # delay here is fine: the calc's silent-link timeouts are
+        # generous. Pump the FrameReader on each iteration so a frame
+        # arriving mid-wait gets picked up immediately.
+        deadline = time.ticks_add(time.ticks_ms(), ON_REQ_TIMEOUT_MS)
+        first_wait_logged = False
+        while True:
+            if outbox[0] is not None:
+                break
+            if reader_holder[0] is not None:
+                try:
+                    inbound = reader_holder[0].poll()
+                    if inbound is not None:
+                        _flash()
+                        outbox[0] = inbound
+                        print("  -> outbox <-", len(inbound), "bytes (in-wait):",
+                              repr(inbound[:32]))
+                        break
+                except OSError as e:
+                    print("  -> FrameReader OSError during on_req wait:", e)
+                    # Fall through to timeout; supervisor loop will
+                    # rebuild the socket on next iteration.
+                    return None
+            if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                print("  -> on_req timeout after",
+                      ON_REQ_TIMEOUT_MS, "ms; Pico will SKIP")
+                return None
+            if not first_wait_logged:
+                print("  -> outbox empty, blocking up to",
+                      ON_REQ_TIMEOUT_MS, "ms for a frame")
+                first_wait_logged = True
+            time.sleep_ms(20)
+
         frame = outbox[0]
         outbox[0] = None
         wire = _frame_to_appvar_payload(frame)
@@ -195,7 +240,7 @@ def run(name=None, expected_type=None):
     sock_holder = [None]
     reader_holder = [None]
     outbox = [None]
-    on_var, on_req = _make_callbacks(sock_holder, outbox)
+    on_var, on_req = _make_callbacks(sock_holder, reader_holder, outbox)
 
     while True:
         try:

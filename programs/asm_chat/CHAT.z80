@@ -23,7 +23,9 @@
 .db     t2ByteTok, tAsmCmp
 
 BUFMAX  .equ    64
-INMAX   .equ    16              ; chars of incoming we render on row 2
+REQ_CMD .equ    $A2             ; DBUS REQ command byte
+CTS_CMD .equ    $09             ; DBUS CTS command byte
+APPVAR_TYPE .equ $15            ; DBUS variable type for AppVar
 
         bcall(_ClrLCDFull)
         ld      hl, 0
@@ -207,127 +209,95 @@ _ra_put:
         bcall(_PutC)
         ret
 
-; await_response: poll NVRAM for CHATIN while yielding to interrupts.
-; Avoids _GetKey entirely (which the OS uses as a takeover trigger on
-; link activity). Each iteration:
-;   1. _ChkFindSym for CHATIN -- exits loop on hit.
-;   2. ei + halt -- sleeps until next interrupt; link IRQ wakes us.
-;   3. _GetCSC for [CLEAR] -- non-blocking abort path that doesn't
-;      itself trigger OS takeover.
-; Cap iterations so a wedged link doesn't hang forever.
-AWAIT_TICKS .equ 2000              ; ~2000 * timer tick = several seconds
-
+; await_response: calc-master REQ for AppVar CHATIN, render reply on
+; row 2. Pico's bridge populates the response from the desktop relay
+; (echo or LLM); on_req blocks Pico-side up to ~5s for a frame, so
+; relay-echo is effectively instant and a slow LLM gets a real wait.
+;
+; Bcall sequence is identical to programs/asm_reqtest/REQTEST.z80; see
+; project_calc_master_req_shipped.md for protocol details.
+;
+; Failure mode: if Pico's outbox stays empty past on_req's timeout it
+; replies SKIP (cmd 0x36) instead of ACK to our REQ. _SendRAMCmd then
+; ERR:LINKs and the OS overlay covers the screen. User dismisses with
+; ON and re-enters CHAT. Live with it; catching ERR:LINK from asm is
+; out of scope for v1.
 await_response:
+        ; Show "..." on row 2 immediately so the user has feedback while
+        ; on_req blocks on the Pico side. If the REQ succeeds we
+        ; overwrite this with the reply; on ERR:LINK the OS error
+        ; overlay covers everything anyway.
         ld      hl, $0002
         ld      (curRow), hl
         bcall(_EraseEOL)
         ld      hl, dots_msg
         bcall(_PutS)
 
-        ld      bc, AWAIT_TICKS
-_aw_loop:
-        push    bc
-        ld      hl, op1_chatin_name
-        rst     rMOV9TOOP1
-        bcall(_ChkFindSym)         ; cf=0 if found, cf=1 if not
-        pop     bc
-        jr      nc, _aw_got
-
-        ; Yield. ei before halt is required: if interrupts were
-        ; disabled by the previous bcall path, halt would lock.
-        ei
-        halt
-
-        ; Non-blocking abort check. _GetCSC doesn't trigger the OS
-        ; takeover that _GetKey does.
-        bcall(_GetCSC)
-        cp      skClear
-        jp      z, _aw_user_abort
-
-        dec     bc
-        ld      a, b
-        or      c
-        jr      nz, _aw_loop
-
-        ; Timed out. Show marker.
-        ld      hl, $0002
-        ld      (curRow), hl
-        bcall(_EraseEOL)
-        ld      hl, timeout_msg
-        bcall(_PutS)
-        ret
-
-_aw_got:
-        call    poll_chatin
-        ret
-
-_aw_user_abort:
-        ld      hl, $0002
-        ld      (curRow), hl
-        bcall(_EraseEOL)
-        ld      hl, abort_msg
-        bcall(_PutS)
-        ret
-
-; poll_chatin: look for an AppVar named CHATIN. If present, copy its
-; text into inbuf (capped to INMAX, NUL-terminated), delete the var,
-; and redraw row 2.
-poll_chatin:
-        push    af
-        push    bc
-        push    de
-        push    hl
-
-        ld      hl, op1_chatin_name
-        rst     rMOV9TOOP1
-        bcall(_ChkFindSym)      ; cf=0 if found, DE=data ptr, HL=size
-        jr      c, _pc_done
-
-        ; Data area is [size_le16][bytes]. Skip the size word.
-        inc     de
-        inc     de
-
-        ; HL holds the AppVar's logical size (== bytes after size word).
-        ; Cap copy length to INMAX.
-        ld      a, h
-        or      a
-        jr      nz, _pc_cap     ; >255 bytes, definitely cap
-        ld      a, l
-        cp      INMAX + 1
-        jr      c, _pc_len_ok
-_pc_cap:
-        ld      a, INMAX
-_pc_len_ok:
-        ld      c, a
-        ld      b, 0
-        ld      hl, inbuf
-        ; ldir copies BC bytes from (DE) to (HL): we want src=DE -> dst=HL,
-        ; but ldir is HL->DE. Swap.
-        ex      de, hl
-        ldir
-        ; HL now points just past the last copied dst byte; NUL-terminate.
+        ; Step 0: SendRAMCmd recommends zeroing sndRecState to dodge
+        ; the documented edge case (varClass=0Ah, sndRecState=08h, large
+        ; DE). Cheap insurance.
         xor     a
-        ld      (hl), a
+        ld      (sndRecState), a
 
-        ; Delete the AppVar. _DelVarArc needs OP1; reload.
-        ld      hl, op1_chatin_name
-        rst     rMOV9TOOP1
-        bcall(_ChkFindSym)      ; reestablish DE/HL/B for _DelVarArc
-        jr      c, _pc_render   ; gone already? just render what we have
-        bcall(_DelVarArc)
+        ; Step 1: send REQ for AppVar CHATIN.
+        ld      a, REQ_CMD
+        ld      hl, var_hdr_req
+        ld      de, 13
+        bcall(_SendRAMCmd)
 
-_pc_render:
-        ld      hl, $0002        ; row 2, col 0
+        ; Step 2: receive VAR header. _Get4Bytes consumes the preamble
+        ; into header @ 8674h; _GetSmallPacket reads the 13-byte body
+        ; into ioData @ 867Dh and ACKs.
+        bcall(_Get4Bytes)
+        bcall(_GetSmallPacket)
+
+        ; Step 3: send CTS (cmd 0x09) and wait for ACK.
+        ld      h, CTS_CMD
+        bcall(_Send4BytePacket)
+
+        ; Step 4: receive DATA. Same pattern as step 2: body lands in
+        ; ioData (overwriting the VAR header we already consumed).
+        bcall(_Get4Bytes)
+        bcall(_GetSmallPacket)
+
+        ; Stash size word for the render branch. _GetSmallPacket put
+        ; the body at ioData and the preamble's size word is at
+        ; header+2/+3.
+        ld      a, (header + 2)
+        ld      c, a
+        ld      a, (header + 3)
+        ld      b, a
+        push    bc
+
+        ; Step 5: consume trailing EOT.
+        bcall(_Get4Bytes)
+
+        ; Render reply on row 2. Body wire format is [size_le16][bytes];
+        ; NUL-terminate at ioData+recv_len, print starting at ioData+2.
+        ; recv_len < 3 means the AppVar had no payload past the size
+        ; prefix (shouldn't happen with our bridge, but be defensive).
+        pop     bc
+        ld      hl, $0002
         ld      (curRow), hl
         bcall(_EraseEOL)
-        ld      hl, inbuf
-        bcall(_PutS)
 
-_pc_done:
-        pop     hl
-        pop     de
-        pop     bc
-        pop     af
+        ld      a, b
+        or      a
+        jr      nz, _aw_render_full      ; > 255 bytes, run with it
+        ld      a, c
+        cp      3
+        jr      nc, _aw_render_full
+
+        ld      hl, empty_msg
+        bcall(_PutS)
+        ret
+
+_aw_render_full:
+        ld      hl, ioData
+        add     hl, bc
+        ld      (hl), 0
+        ld      hl, ioData + 2
+        bcall(_PutS)
         ret
 
 ; sk_to_ascii: A in = scan code (sk*), A out = ASCII or 0 if unmapped.
@@ -424,17 +394,24 @@ alpha_table:
 
 banner: .db     "asm_chat", 0
 dots_msg: .db   "...", 0
-abort_msg: .db  "[aborted]", 0
-timeout_msg: .db "[timeout]", 0
+empty_msg: .db  "[no reply]", 0
 op1_appvar_name:
         .db     AppVarObj, "CHATMSG", 0
-op1_chatin_name:
-        .db     AppVarObj, "CHATIN", 0, 0
+
+; REQ var header for AppVar CHATIN (84+ form, 13 bytes). The size
+; field is 0 in a REQ ("calc doesn't yet know what size to expect").
+; Note: _SendRAMCmd overwrites the leading machine ID byte with the
+; OS's current ID at REQ time; we still keep 0x73 here as a sane
+; default for any code path that may inspect the buffer.
+var_hdr_req:
+        .db     0, 0                     ; size_le16 (REQ: 0)
+        .db     APPVAR_TYPE              ; type
+        .db     "CHATIN", 0, 0           ; 8-byte name (zero-padded)
+        .db     0, 0                     ; version, flags
+
 buf:    .db     0
         .fill   BUFMAX, 0
 buflen: .db     0
-inbuf:  .db     0
-        .fill   INMAX, 0
 alpha:  .db     0                 ; nonzero = alpha mode engaged
 last_sk: .db    0                 ; last scan code seen, for edge-detect
 
