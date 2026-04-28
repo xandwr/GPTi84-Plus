@@ -19,3 +19,6 @@
 [submodule "vendor/tilem"]
 	path = vendor/tilem
 	url = git@github.com:kuba160/tilem-gtk3.git
+[submodule "vendor/ti84wifi"]
+	path = vendor/ti84wifi
+	url = git@github.com:ajcord/WIFI-84.git
