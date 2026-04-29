@@ -1,0 +1,32 @@
+[Unit]
+Description=ti84-superdeluxe relay (LLM mode, Ollama)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+WorkingDirectory=/home/agent/ti84-superdeluxe
+EnvironmentFile=/home/agent/ti84-superdeluxe/.env
+ExecStart=/usr/bin/python -u tools/relay_server.py --host 0.0.0.0 --port 9999 --llm
+Restart=always
+RestartSec=2
+
+# Hardening: matches the original relay.service baseline. The relay
+# only needs stdlib + outbound HTTPS to Ollama, so AF_INET/AF_INET6 is
+# sufficient and MemoryDenyWriteExecute is fine (no JIT, no ctypes).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

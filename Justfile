@@ -7,6 +7,16 @@ SRC     := "src"
 SPASM   := "spasm"
 SPASM_INC := "references/other_projects/spasm"
 
+# nimble deployment targets. The relay runtime lives under the `agent`
+# account; sudo (unit install, systemctl) goes through `xander`. Split
+# matches the real separation: agent owns the service, xander is admin.
+# Both names are ssh_config Host aliases so the right IdentityFile gets
+# picked up automatically: `nimble` -> id_ed25519, `nimble-agent` ->
+# id_ed25519_agent.
+NIMBLE_AGENT := "nimble-agent"
+NIMBLE_ADMIN := "nimble"
+NIMBLE_REPO  := "/home/agent/ti84-superdeluxe"
+
 # default: list recipes
 default:
     @just --list
@@ -110,6 +120,81 @@ relay PORT="9999":
 # with "echo: <text>". v0 stub for the ChatGPT-on-calc loop.
 relay-echo PORT="9999":
     {{PY}} tools/relay_server.py --port {{PORT}} --echo
+
+# Run the relay in LLM mode: parses the bridge's prompt/math frame,
+# calls Ollama (cloud or local) with a JSON-schema format, ASCII-clamps
+# the reply to STR0_MAX_CHARS, ships it back framed. Reads OLLAMA_URL,
+# OLLAMA_MODEL, OLLAMA_API_KEY from .env (gitignored) at the repo root.
+# Local swap: OLLAMA_URL=http://127.0.0.1:11434/api/chat OLLAMA_MODEL=llama3.2 OLLAMA_API_KEY= just relay-llm
+relay-llm PORT="9999":
+    set -a; [ -f .env ] && . ./.env; set +a; \
+    {{PY}} tools/relay_server.py --port {{PORT}} --llm
+
+# Deploy the LLM-mode relay to nimble. Copies .env (gitignored, holds
+# OLLAMA_API_KEY + CF service-token) into agent's repo, locks perms,
+# then uses xander's sudo to install the unit, stop any old relay on
+# :9999, and enable relay-llm. Idempotent. xander's sudo password
+# (one prompt per run) is required on nimble.
+deploy-relay-llm:
+    @echo "==> shipping relay source to {{NIMBLE_AGENT}}:{{NIMBLE_REPO}}/tools/"
+    scp tools/relay_server.py {{NIMBLE_AGENT}}:{{NIMBLE_REPO}}/tools/relay_server.py
+    @echo "==> shipping .env to {{NIMBLE_AGENT}}:{{NIMBLE_REPO}}/.env"
+    scp .env {{NIMBLE_AGENT}}:{{NIMBLE_REPO}}/.env
+    ssh {{NIMBLE_AGENT}} 'chmod 600 {{NIMBLE_REPO}}/.env'
+    @echo "==> shipping relay-llm.service via {{NIMBLE_ADMIN}}"
+    scp deploy/systemd/relay-llm.service {{NIMBLE_ADMIN}}:/tmp/relay-llm.service
+    ssh -t {{NIMBLE_ADMIN}} 'sudo /usr/bin/install -m 644 /tmp/relay-llm.service /etc/systemd/system/relay-llm.service \
+        && sudo /usr/bin/systemctl daemon-reload \
+        && (sudo /usr/bin/systemctl is-active --quiet relay && sudo /usr/bin/systemctl disable --now relay || true) \
+        && sudo /usr/bin/systemctl reset-failed relay-llm \
+        && sudo /usr/bin/systemctl enable --now relay-llm \
+        && sudo /usr/bin/systemctl start wsbridge \
+        && sleep 2 \
+        && sudo /usr/bin/systemctl status --no-pager relay-llm | head -10 \
+        && sudo /usr/bin/systemctl status --no-pager wsbridge   | head -10'
+
+# Tail relay-llm logs from nimble. Read-only; no sudo needed.
+relay-llm-logs:
+    ssh -t {{NIMBLE_ADMIN}} 'journalctl -u relay-llm -f -n 100'
+
+# Print the sudoers drop-in for the relay-llm deploy. Pipe into visudo
+# on nimble to install once: `just sudoers-relay-deploy | ssh nimble \
+#   'sudo tee /etc/sudoers.d/xander-relay-deploy.new >/dev/null && \
+#    sudo visudo -cf /etc/sudoers.d/xander-relay-deploy.new && \
+#    sudo install -m 440 /etc/sudoers.d/xander-relay-deploy.new \
+#                          /etc/sudoers.d/xander-relay-deploy && \
+#    sudo rm /etc/sudoers.d/xander-relay-deploy.new'`
+# The `visudo -cf` validates syntax before commit so a typo can't lock
+# you out of sudo. After install, deploy-relay-llm runs prompt-free.
+sudoers-relay-deploy:
+    @cat deploy/sudoers/xander-relay-deploy
+
+# One-time bootstrap: install this laptop's pubkeys for both nimble
+# accounts. xander gets the standard ssh-copy-id treatment. agent is a
+# service account with no password (locked), so we can't ssh-copy-id
+# into it directly: instead we pipe id_ed25519_agent.pub through
+# xander's ssh and have xander's sudo append it to agent's
+# authorized_keys (idempotent: grep -q before append).
+#
+# Prompts: xander's ssh password ONCE (until xander's pubkey is
+# installed on the first line), then xander's sudo password ONCE for
+# the agent half. After this, every deploy recipe runs prompt-free.
+bootstrap-agent-ssh:
+    @echo "==> installing xander pubkey on {{NIMBLE_ADMIN}}"
+    ssh-copy-id -i ~/.ssh/id_ed25519.pub {{NIMBLE_ADMIN}}
+    @echo "==> installing agent pubkey on agent@nimble (via xander's sudo)"
+    cat ~/.ssh/id_ed25519_agent.pub | ssh -t {{NIMBLE_ADMIN}} \
+        'KEY=$(cat); sudo install -d -m 700 -o agent -g agent /home/agent/.ssh \
+            && sudo touch /home/agent/.ssh/authorized_keys \
+            && sudo chown agent:agent /home/agent/.ssh/authorized_keys \
+            && sudo chmod 600 /home/agent/.ssh/authorized_keys \
+            && (sudo grep -qF "$KEY" /home/agent/.ssh/authorized_keys \
+                || echo "$KEY" | sudo tee -a /home/agent/.ssh/authorized_keys >/dev/null) \
+            && echo "agent authorized_keys now:" \
+            && sudo wc -l /home/agent/.ssh/authorized_keys'
+    @echo "==> verifying both"
+    ssh -o BatchMode=yes -o ConnectTimeout=5 {{NIMBLE_ADMIN}} 'echo ok: $(whoami)@$(hostname)'
+    ssh -o BatchMode=yes -o ConnectTimeout=5 {{NIMBLE_AGENT}} 'echo ok: $(whoami)@$(hostname)'
 
 # Disable Pico autoboot of the bridge (renames main.py -> main.py.off).
 # Use during dev when autoboot fights mpremote run / repl.

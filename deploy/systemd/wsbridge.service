@@ -1,0 +1,28 @@
+[Unit]
+Description=ti84-superdeluxe WS bridge (cloudflared <-> relay)
+After=network-online.target relay-llm.service
+Wants=network-online.target
+BindsTo=relay-llm.service
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+WorkingDirectory=/home/agent/ti84-superdeluxe
+ExecStart=/usr/bin/python -u tools/ws_bridge.py --host 127.0.0.1 --port 8080 --relay-host 127.0.0.1 --relay-port 9999 --ingest-url http://127.0.0.1:8081/api/ingest
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target
