@@ -1,12 +1,3 @@
-ClrHome
-Disp "PROMPT?
-Input Str1
-Disp "MATH?
-Input Str2
-0->N
-Asm(prgmCHAT)
-Disp "WAITING...
-Pause N
 1->P
 Lbl A
 ClrHome

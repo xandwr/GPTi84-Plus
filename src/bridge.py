@@ -181,9 +181,15 @@ INMAX_CHARS = 128
 
 def _ascii_to_str_payload(text):
     """ASCII -> wire-format String var body: [size_le16][token_bytes...].
-    Drops chars the TI charset doesn't have a phase-1 mapping for."""
+
+    drop_unknown=False so the output length matches the input length
+    exactly: chars without a TI-charset mapping become tSpace (0x29)
+    instead of vanishing. The pager paints fixed-grid pages with
+    sub(StrP, 1+(R-1)*16, 16) which assumes constant page length;
+    silently dropping a single '?' would shorten the Str by one char
+    and turn the last row's sub() into ERR:INVALID DIM."""
     text = text[:INMAX_CHARS]
-    body = tokens.ascii_to_tokens_lossy(text, drop_unknown=True)
+    body = tokens.ascii_to_tokens_lossy(text, drop_unknown=False)
     return bytes([len(body) & 0xFF, (len(body) >> 8) & 0xFF]) + body
 
 

@@ -33,6 +33,11 @@ KEYWORDS = [
     # references/other_projects/spasm/ti83plus.inc 'tasm equ 6Ah' in
     # the 2-byte token table at line 4761.
     ("Asm(",     bytes([0xBB, 0x6A])),
+    # sub( = t2ByteTok(0xBB) + tSubStrng(0x0C); the BASIC string
+    # substring built-in. ti83plus.inc line 4674 'tSubStrng equ 0Ch'.
+    # Used by the chat pager to extract row R of a fixed-grid page
+    # via sub(StrP, 1+(R-1)*16, 16).
+    ("sub(",     bytes([0xBB, 0x0C])),
     # Two-char comparison operators. Must come before '<' / '>' /
     # '=' single-char punctuation so longest-match wins.
     ("<=",       bytes([0x6D])),

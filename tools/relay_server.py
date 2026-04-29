@@ -82,6 +82,13 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:120b-cloud")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 OLLAMA_TIMEOUT_S = 25
 
+# Schema: each page is an array of pre-wrapped lines, not one big string.
+# This pushes the wrapping responsibility into the model: the JSON schema
+# constrains each line to <= PAGE_COLS chars and each page to <= PAGE_ROWS
+# lines, so a schema-respecting model literally cannot return overflow.
+# The relay still rewraps server-side as belt-and-braces (see _layout_pages)
+# in case the model emits a lines[] entry that's longer than PAGE_COLS or
+# we get the legacy single-string fallback.
 _REPLY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -89,7 +96,18 @@ _REPLY_SCHEMA = {
             "type": "array",
             "minItems": 1,
             "maxItems": MAX_PAGES,
-            "items": {"type": "string", "maxLength": PAGE_CHARS},
+            "items": {
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": PAGE_ROWS,
+                        "items": {"type": "string", "maxLength": PAGE_COLS},
+                    },
+                },
+                "required": ["lines"],
+            },
         },
     },
     "required": ["pages"],
@@ -100,19 +118,22 @@ _SYSTEM_PROMPT = (
     "flips through your reply with the calculator's left/right arrow "
     "keys, one screenful at a time. The screen shows "
     + str(PAGE_COLS) + " columns by " + str(PAGE_ROWS) + " rows of "
-    "large-font text.\n"
-    "Output rules:\n"
+    "large-font text. Row 8 is reserved for the pager UI.\n"
+    "Output a JSON object {\"pages\": [{\"lines\": [...]}]}. Each page "
+    "has 1.." + str(PAGE_ROWS) + " lines. Each line is 0.."
+    + str(PAGE_COLS) + " ASCII characters and represents one row on "
+    "the calculator screen exactly as it will appear.\n"
+    "Rules:\n"
     " - Plain ASCII only. No unicode, no markdown, no code fences.\n"
-    " - Each page is at most " + str(PAGE_CHARS) + " characters.\n"
-    " - Hard-wrap each line at " + str(PAGE_COLS) + " columns. Insert "
-    "a literal newline ('\\n') where you want a line break. Do not "
-    "break a word mid-letter unless the single token is longer than "
-    + str(PAGE_COLS) + " characters.\n"
+    " - Each line is at most " + str(PAGE_COLS) + " characters. Hard-"
+    "wrap longer content yourself by emitting more lines.\n"
+    " - Do not break a word mid-letter unless the single token is "
+    "longer than " + str(PAGE_COLS) + " chars.\n"
     " - Use up to " + str(MAX_PAGES) + " pages. Use as few as the "
-    "answer needs. A short answer should be a single page. Do not "
-    "pad pages with blank lines to look fuller.\n"
-    " - Keep semantically related content (a code block, a table row, "
-    "a list item) on the same page when it fits.\n"
+    "answer needs; a short answer is one page with one or two lines.\n"
+    " - Do not pad pages with empty lines to look fuller.\n"
+    " - Keep semantically related content (a list item, a code line) "
+    "as one line when it fits, or split across consecutive lines.\n"
     "If the user provided a 'math' field, treat it as a TI-BASIC-style "
     "expression and incorporate it into your answer."
 )
@@ -133,13 +154,124 @@ def _parse_pair(text):
 
 
 def _ascii_clamp(s, n):
-    out = "".join(c if 0x20 <= ord(c) < 0x7F else "?" for c in s)
+    # Use space (not '?') as the replacement so a unicode-flavoured model
+    # response doesn't paint a screen full of '?' on the calc. Preserves
+    # the visual rhythm of the original text and keeps the wire char
+    # count stable regardless of what characters got rejected.
+    out = "".join(c if 0x20 <= ord(c) < 0x7F else " " for c in s)
     return out[:n]
 
 
+def _rewrap_line(line, cols):
+    """Greedy word-wrap one logical line to a list of <=cols substrings.
+    Empty input returns ['']. Words longer than cols are hard-split at
+    char boundaries (the only way to fit a 17-char identifier on a
+    16-col screen). Trailing spaces are stripped per emitted line.
+    """
+    line = line.rstrip()
+    if not line:
+        return [""]
+    words = line.split(" ")
+    out = []
+    cur = ""
+    for w in words:
+        if len(w) > cols:
+            # Word doesn't fit any line. Flush current, then chunk the
+            # word itself into cols-wide slices.
+            if cur:
+                out.append(cur)
+                cur = ""
+            for k in range(0, len(w), cols):
+                chunk = w[k:k + cols]
+                if len(chunk) == cols:
+                    out.append(chunk)
+                else:
+                    cur = chunk
+            continue
+        if not cur:
+            cur = w
+        elif len(cur) + 1 + len(w) <= cols:
+            cur = cur + " " + w
+        else:
+            out.append(cur)
+            cur = w
+    if cur:
+        out.append(cur)
+    return out or [""]
+
+
+def _layout_pages(model_pages, cols=PAGE_COLS, rows=PAGE_ROWS,
+                  max_pages=MAX_PAGES):
+    """Take whatever the model returned and produce fixed-grid pages.
+
+    Input is a list whose entries are either dicts shaped {'lines': [...]}
+    (per the new schema) or plain strings (legacy / fallback). Each
+    returned page is exactly cols*rows chars: rows lines of cols chars,
+    space-padded on the right and concatenated with no separator. The
+    calc paints row R with sub(StrP, 1+(R-1)*cols, cols), so a constant
+    page length removes every edge case from the BASIC pager.
+
+    Wrapping rule: model-emitted line breaks are preserved as "soft"
+    paragraph hints (blank lines stay blank, list items stay on their
+    own line). Each individual line is then hard-wrapped to cols. If a
+    page overflows rows lines, the remainder spills into a new page.
+    """
+    # Normalise into a flat list[str] of "logical lines", with model-
+    # supplied page boundaries inserted as a sentinel so we can prefer
+    # to start a new physical page where the model wanted one.
+    PAGE_BREAK = object()
+    logical = []
+    for entry in model_pages or []:
+        if logical:
+            logical.append(PAGE_BREAK)
+        if isinstance(entry, dict):
+            lines = entry.get("lines") or []
+            for ln in lines:
+                logical.append(_ascii_clamp(str(ln), cols * rows))
+        else:
+            # Legacy/fallback string. Split on its own newlines so we
+            # don't lose paragraph structure the model embedded.
+            text = _ascii_clamp(str(entry), cols * rows * max_pages)
+            for ln in text.split("\n"):
+                logical.append(ln)
+
+    # Hard-wrap each logical line to cols and pack into pages of rows.
+    pages = []
+    cur_rows = []
+    for item in logical:
+        if item is PAGE_BREAK:
+            if cur_rows:
+                pages.append(cur_rows)
+                cur_rows = []
+            continue
+        for wrapped in _rewrap_line(item, cols):
+            if len(cur_rows) >= rows:
+                pages.append(cur_rows)
+                cur_rows = []
+            cur_rows.append(wrapped)
+    if cur_rows:
+        pages.append(cur_rows)
+    if not pages:
+        pages = [[""]]
+
+    pages = pages[:max_pages]
+    # Pad each page out to exactly rows lines and each line to cols chars.
+    out = []
+    for page_rows in pages:
+        padded = list(page_rows[:rows])
+        while len(padded) < rows:
+            padded.append("")
+        grid = "".join((ln[:cols]).ljust(cols) for ln in padded)
+        out.append(grid)
+    return out
+
+
 def _call_ollama(prompt, math):
-    """Returns a list[str] of pages (1..MAX_PAGES). Raises on transport
-    or decode failure; caller wraps to a one-page error reply."""
+    """Returns the raw 'pages' value parsed out of the model response.
+    Each entry is either a {'lines': [...]} dict (preferred, schema-
+    compliant) or a plain string (legacy / pre-schema fallback).
+    Raises on transport or decode failure; caller wraps to a one-page
+    error reply."""
     user = "prompt: " + prompt + "\nmath: " + math
     body = {
         "model": OLLAMA_MODEL,
@@ -167,8 +299,7 @@ def _call_ollama(prompt, math):
         obj = json.loads(content)
         pages = obj.get("pages")
         if isinstance(pages, list) and pages:
-            return [str(p) for p in pages]
-        # Older single-string shape, or no pages key: treat as one page.
+            return pages
         reply = str(obj.get("reply", content)).strip()
         return [reply] if reply else [""]
     except (ValueError, TypeError):
@@ -177,21 +308,20 @@ def _call_ollama(prompt, math):
 
 def _llm_reply_pages(text):
     """Build the framed multi-page body for one inbound prompt frame.
-    Format: 'pages:N\\n' + NUL-separated page bodies. Each page is
-    ASCII-clamped to PAGE_CHARS so the calc side never sees a page
-    that won't fit a Str."""
+    Format: 'pages:N\\n' + NUL-separated page bodies. Each page body is
+    a fixed PAGE_ROWS*PAGE_COLS char grid (space-padded), so the calc
+    can paint row R with a single sub(StrP, 1+(R-1)*PAGE_COLS, PAGE_COLS)
+    without bounds-checking page length."""
     prompt, math = _parse_pair(text)
     print("[%s] llm: prompt=%r math=%r" % (_now(), prompt[:80], math[:80]), flush=True)
     with _LLM_INFLIGHT:
         try:
-            pages = _call_ollama(prompt, math)
+            raw_pages = _call_ollama(prompt, math)
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
             print("[%s] llm error: %s" % (_now(), e), flush=True)
-            pages = ["err: " + str(e)[:PAGE_CHARS - 5]]
-    pages = [_ascii_clamp(p, PAGE_CHARS) for p in pages[:MAX_PAGES]]
-    if not pages:
-        pages = [""]
-    print("[%s] llm: %d pages, sizes=%s" % (
+            raw_pages = ["err: " + str(e)[:PAGE_CHARS - 5]]
+    pages = _layout_pages(raw_pages)
+    print("[%s] llm: %d page(s) laid out, sizes=%s" % (
         _now(), len(pages), [len(p) for p in pages]), flush=True)
     header = ("pages:" + str(len(pages)) + "\n").encode("ascii")
     body = b"\x00".join(p.encode("ascii", errors="replace") for p in pages)
