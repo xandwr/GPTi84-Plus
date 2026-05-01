@@ -147,8 +147,9 @@ deploy-relay-llm:
         && sudo /usr/bin/systemctl daemon-reload \
         && (sudo /usr/bin/systemctl is-active --quiet relay && sudo /usr/bin/systemctl disable --now relay || true) \
         && sudo /usr/bin/systemctl reset-failed relay-llm \
-        && sudo /usr/bin/systemctl enable --now relay-llm \
-        && sudo /usr/bin/systemctl start wsbridge \
+        && sudo /usr/bin/systemctl enable relay-llm \
+        && sudo /usr/bin/systemctl restart relay-llm \
+        && sudo /usr/bin/systemctl restart wsbridge \
         && sleep 2 \
         && sudo /usr/bin/systemctl status --no-pager relay-llm | head -10 \
         && sudo /usr/bin/systemctl status --no-pager wsbridge   | head -10'
