@@ -2,6 +2,8 @@
 
 A TI-84 Plus that talks to a large language model.
 
+![LLM reply rendered on the calculator's home screen](https://cdn.xandwr.com/cemetech/post-1/12_llm-reply-rendered.jpeg)
+
 You type a question on the calculator, hit `enter`, wait a couple of
 seconds, and page through the reply with the left/right arrow keys. No
 hardware mods, no firmware patch, no calculator side-loader: a stock
@@ -48,6 +50,8 @@ TI-BASIC + Z80 programs that drive the UX.
 - Cable: a 2.5mm TRS link cable wired to two Pico GPIOs and ground.
   Default pin mapping in `src/wire.py`: TIP -> GP6, RING -> GP7. Both
   lines have internal pullups enabled.
+
+![Pico W on a breadboard wired to the calculator's link port](https://cdn.xandwr.com/cemetech/post-1/04_pico-breadboard-harness.jpeg)
 
 ## Quick start: LAN-only loop
 
@@ -116,6 +120,14 @@ The chat path uses two transfer directions:
 There is a settle delay (`SETTLE_MS` in `src/bridge.py`, default 600ms)
 between pushes: the OS needs wallclock to rearm the idle silent-link
 receive after each redraw.
+
+![Three Send({4,2,0}) Done lines on the calculator: the first proof-of-life round trip](https://cdn.xandwr.com/cemetech/post-1/06_send-420-done.png)
+
+The web console below tails every WebSocket frame the relay handles,
+which made debugging the calc-to-LLM round trip vastly easier than
+guessing from one side of the wire at a time.
+
+![Web debug console showing live calc <-> relay frames](https://cdn.xandwr.com/cemetech/post-1/08_relay-console.png)
 
 ## Development
 
