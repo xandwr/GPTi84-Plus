@@ -245,3 +245,25 @@ test-e2e: test
     just push  programs/flappy_bird/FLAPPY.8xp
     just roundtrip programs/flappy_bird/FLAPPY.8xp
     just roundtrip programs/debug/SEX.8xp
+
+# Calc must be powered, idle on the home screen, with the link awake
+# (same precondition as `just push`). Rebuilds CHAT/DECK/VIEW from
+# source, syncs the Pico bridge runtime, soft-resets the Pico, then
+# pushes all three programs to the calc. One-shot chat deploy.
+deploy:
+    @echo "==> [1/4] rebuilding chat artifacts"
+    just asm   programs/asm_chat/CHAT.z80
+    just basic programs/basic_deck/DECK.basic
+    just basic programs/basic_view/VIEW.basic
+    @echo "==> [2/4] syncing src/ to Pico"
+    just sync
+    @echo "==> [3/4] resetting Pico"
+    {{MPR}} reset
+    @sleep 1
+    @echo "==> [4/4] pushing CHAT + DECK + VIEW to calc"
+    just push programs/asm_chat/CHAT.8xp
+    just push programs/basic_deck/DECK.8xp
+    just push programs/basic_view/VIEW.8xp
+    @echo "==> restarting Pico bridge (calc pushes preempted it)"
+    {{MPR}} reset
+    @echo "==> deploy complete"
